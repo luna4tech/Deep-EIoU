@@ -58,6 +58,13 @@ def make_parser():
     parser.add_argument("--tsize", default=None, type=int, help="test img size")
     parser.add_argument("--fps", default=30, type=int, help="frame rate (fps)")
     parser.add_argument(
+        "--batch_size",
+        default=8,
+        type=int,
+        help="number of frames to run detection and Re-ID on per forward pass "
+        "(the tracker still runs frame by frame). Use 1 to disable batching.",
+    )
+    parser.add_argument(
         "--fp16",
         dest="fp16",
         default=False,
@@ -179,6 +186,48 @@ class Predictor(object):
             )
         return outputs, img_info
 
+    def inference_batch(self, imgs):
+        """Run detection on a batch of frames in a single forward pass.
+
+        ``imgs`` is a list of BGR ``np.ndarray`` frames, all of the same
+        resolution (which always holds for frames from one video). Every frame
+        therefore preprocesses to the same tensor shape and shares the same
+        resize ``ratio``, so they stack cleanly into one ``(N, 3, H, W)`` batch.
+
+        Returns ``(outputs, img_infos)`` where ``outputs`` is the list returned
+        by ``postprocess`` (one detection set, or ``None``, per frame in input
+        order) and ``img_infos`` is the matching list of per-frame info dicts.
+        """
+        img_infos = []
+        batch = []
+        for img in imgs:
+            height, width = img.shape[:2]
+            img_info = {
+                "id": 0,
+                "file_name": None,
+                "height": height,
+                "width": width,
+                "raw_img": img,
+            }
+            proc_img, ratio = preproc(img, self.test_size, self.rgb_means, self.std)
+            img_info["ratio"] = ratio
+            img_infos.append(img_info)
+            batch.append(torch.from_numpy(proc_img))
+
+        batch = torch.stack(batch, dim=0).float().to(self.device)
+        if self.fp16:
+            batch = batch.half()  # to FP16
+
+        with torch.no_grad():
+            outputs = self.model(batch)
+            if self.decoder is not None:
+                outputs = self.decoder(outputs, dtype=outputs.type())
+            outputs = postprocess(
+                outputs, self.num_classes, self.confthre, self.nmsthre
+            )
+        return outputs, img_infos
+
+
 def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
     cap = cv2.VideoCapture(args.path)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))  # float
@@ -196,50 +245,110 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
     timer = Timer()
     frame_id = 0
     results = []
-    while True:
-        if frame_id % 30 == 0:
-            logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
-        ret_val, frame = cap.read()
-        if ret_val:
-            outputs, img_info = predictor.inference(frame, timer)
-            if outputs[0] is not None:
-                det = outputs[0].cpu().detach().numpy()
-                scale = min(1440/width, 800/height)
-                det /= scale
-                rows_to_remove = np.any(det[:, 0:4] < 1, axis=1) # remove edge detection
-                det = det[~rows_to_remove]
-                cropped_imgs = [frame[max(0,int(y1)):min(height,int(y2)),max(0,int(x1)):min(width,int(x2))] for x1,y1,x2,y2,_,_,_ in det]
-                embs = extractor(cropped_imgs)
-                embs = embs.cpu().detach().numpy()
-                online_targets = tracker.update(det, embs)
-                online_tlwhs = []
-                online_ids = []
-                online_scores = []
-                for t in online_targets:
-                    tlwh = t.last_tlwh
-                    tid = t.track_id
-                    if tlwh[2] * tlwh[3] > args.min_box_area:
-                        online_tlwhs.append(tlwh)
-                        online_ids.append(tid)
-                        online_scores.append(t.score)
-                        results.append(
-                            f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
-                        )
-                timer.toc()
-                online_im = plot_tracking(
-                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
-                )
+    scale = min(1440 / width, 800 / height)
+
+    batch_size = max(1, args.batch_size)
+    if args.trt and batch_size != 1:
+        logger.warning(
+            "TensorRT engine is built for batch size 1; forcing --batch_size 1."
+        )
+        batch_size = 1
+
+    stop = False
+    while not stop:
+        # 1. accumulate up to batch_size frames (the last batch may be smaller)
+        frames = []
+        for _ in range(batch_size):
+            ret_val, frame = cap.read()
+            if not ret_val:
+                break
+            frames.append(frame)
+        if not frames:
+            break
+
+        logger.info('Processing frame {} ({:.2f} fps)'.format(
+            frame_id, frame_id / max(1e-5, timer.total_time)))
+
+        timer.tic()
+
+        # 2. one detector forward for the whole batch
+        outputs, img_infos = predictor.inference_batch(frames)
+
+        # 3a. per-frame detections; gather all crops for a single Re-ID forward
+        per_frame_dets = []
+        crop_counts = []
+        all_crops = []
+        for output, img_info in zip(outputs, img_infos):
+            if output is None:
+                per_frame_dets.append(None)
+                crop_counts.append(0)
+                continue
+            det = output.cpu().detach().numpy()
+            det /= scale
+            rows_to_remove = np.any(det[:, 0:4] < 1, axis=1)  # remove edge detection
+            det = det[~rows_to_remove]
+            raw_img = img_info['raw_img']
+            cropped_imgs = [
+                raw_img[max(0, int(y1)):min(height, int(y2)),
+                        max(0, int(x1)):min(width, int(x2))]
+                for x1, y1, x2, y2, _, _, _ in det
+            ]
+            per_frame_dets.append(det)
+            crop_counts.append(len(cropped_imgs))
+            all_crops.extend(cropped_imgs)
+
+        # 3b. one Re-ID forward for every crop across the batch
+        if all_crops:
+            all_embs = extractor(all_crops).cpu().detach().numpy()
+        else:
+            all_embs = np.empty((0, 0), dtype=np.float32)
+
+        # 4. tracker runs frame by frame, in original order (NOT batched)
+        offset = 0
+        overlays = []  # (raw_img, online_tlwhs, online_ids, frame_id)
+        for i, (img_info, det) in enumerate(zip(img_infos, per_frame_dets)):
+            cur_frame_id = frame_id + i
+            raw_img = img_info['raw_img']
+            if det is None:
+                overlays.append((raw_img, None, None, cur_frame_id))
+                continue
+            n = crop_counts[i]
+            embs = all_embs[offset:offset + n]
+            offset += n
+            online_targets = tracker.update(det, embs)
+            online_tlwhs = []
+            online_ids = []
+            for t in online_targets:
+                tlwh = t.last_tlwh
+                tid = t.track_id
+                if tlwh[2] * tlwh[3] > args.min_box_area:
+                    online_tlwhs.append(tlwh)
+                    online_ids.append(tid)
+                    results.append(
+                        f"{cur_frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
+                    )
+            overlays.append((raw_img, online_tlwhs, online_ids, cur_frame_id))
+
+        timer.toc()
+        batch_fps = len(frames) / max(1e-5, timer.diff)
+
+        # 5. draw + write each frame in order
+        for raw_img, online_tlwhs, online_ids, cur_frame_id in overlays:
+            if online_tlwhs is None:
+                online_im = raw_img
             else:
-                timer.toc()
-                online_im = img_info['raw_img']
+                online_im = plot_tracking(
+                    raw_img, online_tlwhs, online_ids,
+                    frame_id=cur_frame_id + 1, fps=batch_fps,
+                )
             if args.save_result:
                 vid_writer.write(online_im)
-            ch = cv2.waitKey(1)
-            if ch == 27 or ch == ord("q") or ch == ord("Q"):
-                break
-        else:
-            break
-        frame_id += 1
+
+        frame_id += len(frames)
+
+        ch = cv2.waitKey(1)
+        if ch == 27 or ch == ord("q") or ch == ord("Q"):
+            stop = True
 
     if args.save_result:
         res_file = osp.join(vis_folder, f"{timestamp}.txt")
