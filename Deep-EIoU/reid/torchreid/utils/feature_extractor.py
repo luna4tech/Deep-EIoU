@@ -2,6 +2,7 @@ from __future__ import absolute_import
 import numpy as np
 import torch
 import torchvision.transforms as T
+from torchvision.transforms import functional as TF
 from PIL import Image
 
 from torchreid.utils import (
@@ -105,9 +106,38 @@ class FeatureExtractor(object):
         self.preprocess = preprocess
         self.to_pil = to_pil
         self.device = device
+        self.image_size = image_size
+        self.pixel_norm = pixel_norm
+        self.pixel_mean = torch.tensor(pixel_mean, device=device).view(1, 3, 1, 1)
+        self.pixel_std = torch.tensor(pixel_std, device=device).view(1, 3, 1, 1)
+
+    def _preprocess_numpy_batch(self, crops):
+        """Resize + normalize a list of HWC uint8 crops on the GPU.
+
+        Mirrors T.Resize(antialias) + T.ToTensor + T.Normalize but avoids the
+        per-crop PIL round-trip on the CPU. Channels are left in their incoming
+        order (no BGR<->RGB swap), matching the ToPILImage path used elsewhere.
+        """
+        size = [self.image_size[0], self.image_size[1]]
+        resized = []
+        for crop in crops:
+            t = torch.from_numpy(np.ascontiguousarray(crop)).to(self.device)
+            t = t.permute(2, 0, 1).float()           # HWC -> CHW
+            t = TF.resize(t, size, antialias=True)    # bilinear, matches PIL
+            resized.append(t)
+        images = torch.stack(resized, dim=0) / 255.0  # T.ToTensor scaling
+        if self.pixel_norm:
+            images = (images - self.pixel_mean) / self.pixel_std
+        return images
 
     def __call__(self, input):
-        if isinstance(input, list):
+        if isinstance(input, list) and len(input) > 0 and all(
+            isinstance(e, np.ndarray) for e in input
+        ):
+            # Fast path (demo): a list of numpy crops, batched on the GPU.
+            images = self._preprocess_numpy_batch(input)
+
+        elif isinstance(input, list):
             images = []
 
             for element in input:
