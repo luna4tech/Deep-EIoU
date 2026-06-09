@@ -6,6 +6,7 @@ import time
 import cv2
 import torch
 import sys
+from collections import defaultdict
 sys.path.append('.')
 
 from loguru import logger
@@ -22,6 +23,27 @@ import torchvision.transforms as T
 
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
+
+# Ordered list of pipeline stages we profile, used for readable log output.
+STAGE_ORDER = [
+    "read",            # cap.read(): video decode
+    "det_preproc",     # YOLOX letterbox/normalize + H2D copy (CPU)
+    "det_forward",     # YOLOX forward pass (GPU)
+    "det_postprocess", # conf filter + NMS
+    "rescale_clean",   # rescale boxes + drop edge detections (CPU)
+    "crop",            # crop player patches out of the frame (CPU)
+    "reid",            # OSNet appearance embedding (GPU)
+    "track",           # Deep-EIoU association (CPU)
+    "vis",             # plot_tracking overlay (CPU)
+    "write",           # vid_writer.write encode (CPU)
+]
+
+
+def cuda_sync(device):
+    """Block until queued CUDA work finishes so timers measure GPU ops, not just
+    the async kernel launch. No-op on CPU."""
+    if isinstance(device, torch.device) and device.type == "cuda":
+        torch.cuda.synchronize()
 
 
 def make_parser():
@@ -163,20 +185,37 @@ class Predictor(object):
         img_info["width"] = width
         img_info["raw_img"] = img
 
+        timings = {}
+
+        # --- preprocessing (CPU) + host->device copy ---
+        t0 = time.time()
         img, ratio = preproc(img, self.test_size, self.rgb_means, self.std)
         img_info["ratio"] = ratio
         img = torch.from_numpy(img).unsqueeze(0).float().to(self.device)
         if self.fp16:
             img = img.half()  # to FP16
+        cuda_sync(self.device)
+        timings["det_preproc"] = time.time() - t0
 
         with torch.no_grad():
             timer.tic()
+            # --- detector forward (GPU) ---
+            t0 = time.time()
             outputs = self.model(img)
             if self.decoder is not None:
                 outputs = self.decoder(outputs, dtype=outputs.type())
+            cuda_sync(self.device)
+            timings["det_forward"] = time.time() - t0
+
+            # --- postprocess: confidence filter + NMS ---
+            t0 = time.time()
             outputs = postprocess(
                 outputs, self.num_classes, self.confthre, self.nmsthre
             )
+            cuda_sync(self.device)
+            timings["det_postprocess"] = time.time() - t0
+
+        img_info["timings"] = timings
         return outputs, img_info
 
 def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
@@ -196,22 +235,48 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
     timer = Timer()
     frame_id = 0
     results = []
+    device = predictor.device
+    stage_times = defaultdict(float)  # cumulative seconds per stage
+    profiled_frames = 0
     while True:
         if frame_id % 30 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
+        # --- read / decode frame ---
+        t0 = time.time()
         ret_val, frame = cap.read()
+        stage_times['read'] += time.time() - t0
         if ret_val:
             outputs, img_info = predictor.inference(frame, timer)
+            # fold in detection sub-stage timings recorded inside inference()
+            for k, v in img_info.get("timings", {}).items():
+                stage_times[k] += v
             if outputs[0] is not None:
+                # --- rescale boxes + drop edge detections (CPU) ---
+                t0 = time.time()
                 det = outputs[0].cpu().detach().numpy()
                 scale = min(1440/width, 800/height)
                 det /= scale
                 rows_to_remove = np.any(det[:, 0:4] < 1, axis=1) # remove edge detection
                 det = det[~rows_to_remove]
+                stage_times['rescale_clean'] += time.time() - t0
+
+                # --- crop player patches out of the frame (CPU) ---
+                t0 = time.time()
                 cropped_imgs = [frame[max(0,int(y1)):min(height,int(y2)),max(0,int(x1)):min(width,int(x2))] for x1,y1,x2,y2,_,_,_ in det]
+                stage_times['crop'] += time.time() - t0
+
+                # --- ReID appearance embedding (GPU) ---
+                t0 = time.time()
                 embs = extractor(cropped_imgs)
                 embs = embs.cpu().detach().numpy()
+                cuda_sync(device)
+                stage_times['reid'] += time.time() - t0
+
+                # --- Deep-EIoU association (CPU) ---
+                t0 = time.time()
                 online_targets = tracker.update(det, embs)
+                stage_times['track'] += time.time() - t0
+
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
@@ -226,14 +291,32 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
                             f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                         )
                 timer.toc()
+                # --- visualization overlay (CPU) ---
+                t0 = time.time()
                 online_im = plot_tracking(
                     img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
                 )
+                stage_times['vis'] += time.time() - t0
             else:
                 timer.toc()
                 online_im = img_info['raw_img']
             if args.save_result:
+                # --- encode / write frame (CPU) ---
+                t0 = time.time()
                 vid_writer.write(online_im)
+                stage_times['write'] += time.time() - t0
+            profiled_frames += 1
+
+            # periodic per-stage breakdown
+            if frame_id % 30 == 0 and profiled_frames > 0:
+                breakdown = " | ".join(
+                    "{}: {:.1f}ms".format(k, 1000.0 * stage_times[k] / profiled_frames)
+                    for k in STAGE_ORDER if k in stage_times
+                )
+                total_ms = 1000.0 * sum(stage_times.values()) / profiled_frames
+                logger.info("avg/frame {:.1f}ms ({:.2f} fps) | {}".format(
+                    total_ms, 1000.0 / max(1e-5, total_ms), breakdown))
+
             ch = cv2.waitKey(1)
             if ch == 27 or ch == ord("q") or ch == ord("Q"):
                 break
@@ -246,6 +329,21 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
         with open(res_file, 'w') as f:
             f.writelines(results)
         logger.info(f"save results to {res_file}")
+
+    # --- final timing summary ---
+    if profiled_frames > 0:
+        total = sum(stage_times.values())
+        logger.info("=" * 60)
+        logger.info("Timing summary over {} frames:".format(profiled_frames))
+        for k in STAGE_ORDER:
+            if k in stage_times:
+                ms = 1000.0 * stage_times[k] / profiled_frames
+                pct = 100.0 * stage_times[k] / max(1e-9, total)
+                logger.info("  {:<16s} {:>7.1f} ms/frame  ({:>5.1f}%)".format(k, ms, pct))
+        total_ms = 1000.0 * total / profiled_frames
+        logger.info("  {:<16s} {:>7.1f} ms/frame  ({:.2f} fps)".format(
+            "TOTAL", total_ms, 1000.0 / max(1e-5, total_ms)))
+        logger.info("=" * 60)
 
 
 def main(exp, args):
