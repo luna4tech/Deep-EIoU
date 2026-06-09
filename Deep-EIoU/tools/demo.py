@@ -323,7 +323,18 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
 
                 # --- crop player patches out of the frame (CPU) ---
                 t0 = time.time()
-                cropped_imgs = [frame[max(0,int(y1)):min(height,int(y2)),max(0,int(x1)):min(width,int(x2))] for x1,y1,x2,y2,_,_,_ in det]
+                # Clamp boxes to the frame and drop any that collapse to zero
+                # width/height after integer rounding (boxes past the bottom/
+                # right edge, or sub-pixel-thin boxes). An empty crop would
+                # otherwise crash the ReID resize with "input (H: 0, ...)".
+                x1 = np.clip(det[:, 0].astype(int), 0, width)
+                y1 = np.clip(det[:, 1].astype(int), 0, height)
+                x2 = np.clip(det[:, 2].astype(int), 0, width)
+                y2 = np.clip(det[:, 3].astype(int), 0, height)
+                keep = (x2 > x1) & (y2 > y1)
+                det = det[keep]
+                x1, y1, x2, y2 = x1[keep], y1[keep], x2[keep], y2[keep]
+                cropped_imgs = [frame[yt:yb, xl:xr] for xl, yt, xr, yb in zip(x1, y1, x2, y2)]
                 stage_times['crop'] += time.time() - t0
 
                 # --- ReID appearance embedding (GPU) ---
