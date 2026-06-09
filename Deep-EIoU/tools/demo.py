@@ -100,6 +100,13 @@ def make_parser():
         help="disable writing the annotated video; only the .txt results are saved "
              "(an annotated video can be rebuilt later from the .txt)",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+        help="log per-stage timing. Adds cuda synchronizes that prevent CPU/GPU "
+             "overlap and slightly slow the pipeline, so it is off by default.",
+    )
 
     # exp file
     parser.add_argument(
@@ -191,7 +198,8 @@ class Predictor(object):
         trt_file=None,
         decoder=None,
         device=torch.device("cpu"),
-        fp16=False
+        fp16=False,
+        profile=False
     ):
         self.model = model
         self.decoder = decoder
@@ -201,6 +209,7 @@ class Predictor(object):
         self.test_size = exp.test_size
         self.device = device
         self.fp16 = fp16
+        self.profile = profile
         if trt_file is not None:
             from torch2trt import TRTModule
 
@@ -227,33 +236,40 @@ class Predictor(object):
         img_info["raw_img"] = img
 
         timings = {}
+        profile = self.profile
 
         # --- preprocessing: CPU letterbox (uint8) + GPU normalize ---
-        t0 = time.time()
+        if profile:
+            t0 = time.time()
         img, ratio = preproc_to_tensor(
             img, self.test_size, self.rgb_means, self.std, self.device, self.fp16
         )
         img_info["ratio"] = ratio
-        cuda_sync(self.device)
-        timings["det_preproc"] = time.time() - t0
+        if profile:
+            cuda_sync(self.device)
+            timings["det_preproc"] = time.time() - t0
 
         with torch.no_grad():
             timer.tic()
             # --- detector forward (GPU) ---
-            t0 = time.time()
+            if profile:
+                t0 = time.time()
             outputs = self.model(img)
             if self.decoder is not None:
                 outputs = self.decoder(outputs, dtype=outputs.type())
-            cuda_sync(self.device)
-            timings["det_forward"] = time.time() - t0
+            if profile:
+                cuda_sync(self.device)
+                timings["det_forward"] = time.time() - t0
 
             # --- postprocess: confidence filter + NMS ---
-            t0 = time.time()
+            if profile:
+                t0 = time.time()
             outputs = postprocess(
                 outputs, self.num_classes, self.confthre, self.nmsthre
             )
-            cuda_sync(self.device)
-            timings["det_postprocess"] = time.time() - t0
+            if profile:
+                cuda_sync(self.device)
+                timings["det_postprocess"] = time.time() - t0
 
         img_info["timings"] = timings
         return outputs, img_info
@@ -280,6 +296,7 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
     frame_id = 0
     results = []
     device = predictor.device
+    profile = args.profile
     stage_times = defaultdict(float)  # cumulative seconds per stage
     profiled_frames = 0
     while True:
@@ -313,7 +330,8 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
                 t0 = time.time()
                 embs = extractor(cropped_imgs)
                 embs = embs.cpu().detach().numpy()
-                cuda_sync(device)
+                if profile:
+                    cuda_sync(device)
                 stage_times['reid'] += time.time() - t0
 
                 # --- Deep-EIoU association (CPU) ---
@@ -353,7 +371,7 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
             profiled_frames += 1
 
             # periodic per-stage breakdown
-            if frame_id % 30 == 0 and profiled_frames > 0:
+            if profile and frame_id % 30 == 0 and profiled_frames > 0:
                 breakdown = " | ".join(
                     "{}: {:.1f}ms".format(k, 1000.0 * stage_times[k] / profiled_frames)
                     for k in STAGE_ORDER if k in stage_times
@@ -380,7 +398,7 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
         logger.info(f"save results to {res_file}")
 
     # --- final timing summary ---
-    if profiled_frames > 0:
+    if profile and profiled_frames > 0:
         total = sum(stage_times.values())
         logger.info("=" * 60)
         logger.info("Timing summary over {} frames:".format(profiled_frames))
@@ -453,7 +471,7 @@ def main(exp, args):
         trt_file = None
         decoder = None
 
-    predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16)
+    predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16, args.profile)
     current_time = time.localtime()
     
     extractor = FeatureExtractor(
