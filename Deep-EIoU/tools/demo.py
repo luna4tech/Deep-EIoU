@@ -92,6 +92,14 @@ def make_parser():
         default=True,
         help="whether to save the inference result of image/video",
     )
+    parser.add_argument(
+        "--no_save_video",
+        dest="save_video",
+        action="store_false",
+        default=True,
+        help="disable writing the annotated video; only the .txt results are saved "
+             "(an annotated video can be rebuilt later from the .txt)",
+    )
 
     # exp file
     parser.add_argument(
@@ -256,13 +264,17 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))  # float
     fps = cap.get(cv2.CAP_PROP_FPS)
     timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-    save_folder = osp.join(vis_folder, timestamp)
-    os.makedirs(save_folder, exist_ok=True)
-    save_path = osp.join(save_folder, args.path.split("/")[-1])
-    logger.info(f"video save_path is {save_path}")
-    vid_writer = cv2.VideoWriter(
-        save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
-    )
+    vid_writer = None
+    if args.save_video:
+        save_folder = osp.join(vis_folder, timestamp)
+        os.makedirs(save_folder, exist_ok=True)
+        save_path = osp.join(save_folder, args.path.split("/")[-1])
+        logger.info(f"video save_path is {save_path}")
+        vid_writer = cv2.VideoWriter(
+            save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
+        )
+    else:
+        logger.info("video annotation disabled (--no_save_video); saving text results only")
     tracker = Deep_EIoU(args, frame_rate=30)
     timer = Timer()
     frame_id = 0
@@ -323,16 +335,17 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
                             f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                         )
                 timer.toc()
-                # --- visualization overlay (CPU) ---
-                t0 = time.time()
-                online_im = plot_tracking(
-                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
-                )
-                stage_times['vis'] += time.time() - t0
+                # --- visualization overlay (CPU), only needed for the video ---
+                if args.save_video:
+                    t0 = time.time()
+                    online_im = plot_tracking(
+                        img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
+                    )
+                    stage_times['vis'] += time.time() - t0
             else:
                 timer.toc()
                 online_im = img_info['raw_img']
-            if args.save_result:
+            if args.save_video:
                 # --- encode / write frame (CPU) ---
                 t0 = time.time()
                 vid_writer.write(online_im)
@@ -355,6 +368,10 @@ def imageflow_demo(predictor, extractor, vis_folder, current_time, args):
         else:
             break
         frame_id += 1
+
+    cap.release()
+    if vid_writer is not None:
+        vid_writer.release()
 
     if args.save_result:
         res_file = osp.join(vis_folder, f"{timestamp}.txt")
