@@ -1,7 +1,7 @@
 from __future__ import absolute_import
 import numpy as np
 import torch
-import torchvision.transforms as T
+import torch.nn.functional as F
 from PIL import Image
 
 from torchreid.utils import (
@@ -87,56 +87,77 @@ class FeatureExtractor(object):
         if model_path and check_isfile(model_path):
             load_pretrained_weights(model, model_path)
 
-        # Build transform functions
-        transforms = []
-        transforms += [T.Resize(image_size)]
-        transforms += [T.ToTensor()]
-        if pixel_norm:
-            transforms += [T.Normalize(mean=pixel_mean, std=pixel_std)]
-        preprocess = T.Compose(transforms)
-
-        to_pil = T.ToPILImage()
-
         device = torch.device(device)
         model.to(device)
 
+        # Normalization constants as (1, 3, 1, 1) tensors so a whole
+        # (B, C, H, W) batch can be normalized in one broadcasted op on device.
+        mean = torch.tensor(pixel_mean, device=device).view(1, 3, 1, 1)
+        std = torch.tensor(pixel_std, device=device).view(1, 3, 1, 1)
+
         # Class attributes
         self.model = model
-        self.preprocess = preprocess
-        self.to_pil = to_pil
+        self.image_size = image_size  # (height, width)
+        self.pixel_norm = pixel_norm
+        self.mean = mean
+        self.std = std
         self.device = device
+
+    def _preprocess(self, crops):
+        """Resize + normalize a list of HxWxC numpy crops into one GPU batch.
+
+        Each crop is moved to the GPU as uint8 (a quarter of the bytes of a
+        float transfer), resized to ``image_size`` with a bilinear
+        ``F.interpolate``, then the whole stack is scaled to [0, 1] and
+        normalized as a single broadcasted tensor op. No PIL, no per-crop CPU
+        resize/normalize on the critical path.
+
+        Crops have different sizes, so they are resized individually before they
+        can be stacked -- but each resize now runs on the GPU, and all the heavy
+        work (resize/normalize) happens in one batch.
+
+        Returns a ``(N, 3, H, W)`` float tensor on ``self.device``.
+        """
+        height, width = self.image_size
+        resized = []
+        for crop in crops:
+            tensor = torch.from_numpy(np.ascontiguousarray(crop)).to(self.device)
+            tensor = tensor.permute(2, 0, 1).unsqueeze(0).float()  # (1, C, H, W)
+            tensor = F.interpolate(
+                tensor, size=(height, width),
+                mode='bilinear', align_corners=False
+            )
+            resized.append(tensor)
+
+        batch = torch.cat(resized, dim=0) / 255.0
+        if self.pixel_norm:
+            batch = (batch - self.mean) / self.std
+        return batch
 
     def __call__(self, input):
         if isinstance(input, list):
-            images = []
-
+            crops = []
             for element in input:
                 if isinstance(element, str):
                     image = Image.open(element).convert('RGB')
+                    crops.append(np.asarray(image))
 
                 elif isinstance(element, np.ndarray):
-                    image = self.to_pil(element)
+                    crops.append(element)
 
                 else:
                     raise TypeError(
                         'Type of each element must belong to [str | numpy.ndarray]'
                     )
 
-                image = self.preprocess(image)
-                images.append(image)
-
-            images = torch.stack(images, dim=0)
-            images = images.to(self.device)
+            images = self._preprocess(crops)
 
         elif isinstance(input, str):
             image = Image.open(input).convert('RGB')
-            image = self.preprocess(image)
-            images = image.unsqueeze(0).to(self.device)
+            images = self._preprocess([np.asarray(image)])
 
         elif isinstance(input, np.ndarray):
-            image = self.to_pil(input)
-            image = self.preprocess(image)
-            images = image.unsqueeze(0).to(self.device)
+            images = self._preprocess([input])
 
         elif isinstance(input, torch.Tensor):
             if input.dim() == 3:
