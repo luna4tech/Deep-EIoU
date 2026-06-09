@@ -11,7 +11,6 @@ sys.path.append('.')
 
 from loguru import logger
 
-from yolox.data.data_augment import preproc
 from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess
 from yolox.utils.visualize import plot_tracking
@@ -44,6 +43,40 @@ def cuda_sync(device):
     the async kernel launch. No-op on CPU."""
     if isinstance(device, torch.device) and device.type == "cuda":
         torch.cuda.synchronize()
+
+
+def preproc_to_tensor(image, input_size, mean, std, device, fp16):
+    """Letterbox-resize on CPU (kept as uint8), then do the per-pixel float
+    normalization on the GPU.
+
+    Numerically equivalent to yolox.data.data_augment.preproc, but avoids the
+    float64 CPU normalize (the old det_preproc hot path) and transfers 1/4 the
+    bytes by copying uint8 to the device instead of float32.
+    """
+    if len(image.shape) == 3:
+        padded_img = np.full((input_size[0], input_size[1], 3), 114, dtype=np.uint8)
+    else:
+        padded_img = np.full(input_size, 114, dtype=np.uint8)
+
+    r = min(input_size[0] / image.shape[0], input_size[1] / image.shape[1])
+    resized_img = cv2.resize(
+        image,
+        (int(image.shape[1] * r), int(image.shape[0] * r)),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    padded_img[: int(image.shape[0] * r), : int(image.shape[1] * r)] = resized_img
+
+    # uint8 HWC(BGR) -> device, then float normalize on the GPU
+    t = torch.from_numpy(padded_img).to(device)
+    t = t.flip(2)                               # BGR -> RGB (matches [:, :, ::-1])
+    t = t.permute(2, 0, 1).float() / 255.0      # HWC -> CHW, scale to [0, 1]
+    mean_t = torch.as_tensor(mean, dtype=torch.float32, device=device).view(-1, 1, 1)
+    std_t = torch.as_tensor(std, dtype=torch.float32, device=device).view(-1, 1, 1)
+    t = (t - mean_t) / std_t
+    t = t.unsqueeze(0).contiguous()
+    if fp16:
+        t = t.half()
+    return t, r
 
 
 def make_parser():
@@ -187,13 +220,12 @@ class Predictor(object):
 
         timings = {}
 
-        # --- preprocessing (CPU) + host->device copy ---
+        # --- preprocessing: CPU letterbox (uint8) + GPU normalize ---
         t0 = time.time()
-        img, ratio = preproc(img, self.test_size, self.rgb_means, self.std)
+        img, ratio = preproc_to_tensor(
+            img, self.test_size, self.rgb_means, self.std, self.device, self.fp16
+        )
         img_info["ratio"] = ratio
-        img = torch.from_numpy(img).unsqueeze(0).float().to(self.device)
-        if self.fp16:
-            img = img.half()  # to FP16
         cuda_sync(self.device)
         timings["det_preproc"] = time.time() - t0
 
